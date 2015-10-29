@@ -1112,6 +1112,7 @@ static const struct inode_operations xfs_inode_operations = {
 	.listxattr		= xfs_vn_listxattr,
 	.fiemap			= xfs_vn_fiemap,
 	.update_time		= xfs_vn_update_time,
+	.get_block		= xfs_get_blocks_direct,
 };
 
 static const struct inode_operations xfs_dir_inode_operations = {
