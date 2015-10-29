@@ -24,10 +24,13 @@
 #include <linux/memcontrol.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/pagevec.h>
 #include <linux/pmem.h>
+#include <linux/rmap.h>
 #include <linux/sched.h>
 #include <linux/uio.h>
 #include <linux/vmstat.h>
+#include <linux/dax.h>
 
 /*
  * dax_clear_blocks() is called from within transaction context from XFS,
@@ -287,6 +290,42 @@ static int copy_user_bh(struct page *to, struct buffer_head *bh,
 	return 0;
 }
 
+static int dax_dirty_pgoff(struct vm_area_struct *vma,
+		struct address_space *mapping, unsigned long pgoff,
+		bool pmd_entry)
+{
+	struct radix_tree_root *page_tree = &mapping->page_tree;
+	void *tag;
+	int error = 0;
+
+	__mark_inode_dirty(file_inode(vma->vm_file), I_DIRTY_PAGES);
+
+	spin_lock_irq(&mapping->tree_lock);
+
+	tag = radix_tree_lookup(page_tree, pgoff);
+	if (tag) {
+		if (pmd_entry && tag == RADIX_TREE_DAX_PTE) {
+			radix_tree_delete(&mapping->page_tree, pgoff);
+			mapping->nrdax--;
+		} else
+			goto out;
+	}
+
+	if (pmd_entry)
+		error = radix_tree_insert(page_tree, pgoff, RADIX_TREE_DAX_PMD);
+	else
+		error = radix_tree_insert(page_tree, pgoff, RADIX_TREE_DAX_PTE);
+
+	if (error)
+		goto out;
+
+	mapping->nrdax++;
+	radix_tree_tag_set(page_tree, pgoff, PAGECACHE_TAG_DIRTY);
+ out:
+	spin_unlock_irq(&mapping->tree_lock);
+	return error;
+}
+
 static int dax_insert_mapping(struct inode *inode, struct buffer_head *bh,
 			struct vm_area_struct *vma, struct vm_fault *vmf)
 {
@@ -450,6 +489,7 @@ int __dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		delete_from_page_cache(page);
 		unlock_page(page);
 		page_cache_release(page);
+		page = NULL;
 	}
 
 	/*
@@ -463,6 +503,13 @@ int __dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 	 * as for normal BH based IO completions.
 	 */
 	error = dax_insert_mapping(inode, &bh, vma, vmf);
+	if (error)
+		goto out;
+
+	error = dax_dirty_pgoff(vma, inode->i_mapping, vmf->pgoff, false);
+	if (error)
+		goto out;
+
 	if (buffer_unwritten(&bh)) {
 		if (complete_unwritten)
 			complete_unwritten(&bh, !error);
@@ -537,7 +584,7 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 	pgoff_t size, pgoff;
 	sector_t block, sector;
 	unsigned long pfn;
-	int result = 0;
+	int error, result = 0;
 
 	/* Fall back to PTEs if we're going to COW */
 	if (write && !(vma->vm_flags & VM_SHARED))
@@ -638,6 +685,10 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		}
 
 		result |= vmf_insert_pfn_pmd(vma, address, pmd, pfn, write);
+
+		error = dax_dirty_pgoff(vma, inode->i_mapping, pgoff, true);
+		if (error)
+			goto fallback;
 	}
 
  out:
@@ -693,11 +744,11 @@ EXPORT_SYMBOL_GPL(dax_pmd_fault);
  */
 int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
-	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+	struct file *file = vma->vm_file;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
 
-	sb_start_pagefault(sb);
-	file_update_time(vma->vm_file);
-	sb_end_pagefault(sb);
+	dax_dirty_pgoff(vma, inode->i_mapping, vmf->pgoff, false);
 	return VM_FAULT_NOPAGE;
 }
 EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
@@ -772,3 +823,103 @@ int dax_truncate_page(struct inode *inode, loff_t from, get_block_t get_block)
 	return dax_zero_page_range(inode, from, length, get_block);
 }
 EXPORT_SYMBOL_GPL(dax_truncate_page);
+
+static int dax_flush_one_mapping(struct address_space *mapping,
+		struct inode *inode, sector_t block, void *tag)
+{
+	get_block_t *get_block = inode->i_op->get_block;
+	struct buffer_head bh;
+	void __pmem *addr;
+	int ret;
+
+	BUG_ON(tag != RADIX_TREE_DAX_PMD && tag != RADIX_TREE_DAX_PTE);
+
+	memset(&bh, 0, sizeof(bh));
+
+	if (tag == RADIX_TREE_DAX_PMD)
+		bh.b_size = PMD_SIZE;
+	else
+		bh.b_size = PAGE_SIZE;
+
+	ret = get_block(inode, block, &bh, false);
+	BUG_ON(!buffer_written(&bh));
+	if (ret < 0)
+		return ret;
+
+	ret = dax_get_addr(&bh, &addr, inode->i_blkbits);
+	if (ret < 0)
+		return ret;
+
+	if (tag == RADIX_TREE_DAX_PMD)
+		WARN_ON(ret != PMD_SIZE);
+	else
+		WARN_ON(ret != PAGE_SIZE);
+
+	wb_cache_pmem(addr, ret);
+
+	spin_lock_irq(&mapping->tree_lock);
+	radix_tree_delete(&mapping->page_tree, block);
+	spin_unlock_irq(&mapping->tree_lock);
+	mapping->nrdax--;
+
+	return pgoff_mkclean(block, mapping);
+}
+
+/*
+ * flush the mapping to the persistent domain within the byte range of (start,
+ * end). This is required by data integrity operations to ensure file data is on
+ * persistent storage prior to completion of the operation. It also requires us
+ * to clean the mappings (i.e. write -> RO) so that we'll get a new fault when
+ * the file is written to again so wehave an indication that we need to flush
+ * the mapping if a data integrity operation takes place.
+ *
+ * We don't need commits to storage here - the filesystems will issue flushes
+ * appropriately at the conclusion of the data integrity operation via REQ_FUA
+ * writes or blkdev_issue_flush() commands.  This requires the DAX block device
+ * to implement persistent storage domain fencing/commits on receiving a
+ * REQ_FLUSH or REQ_FUA request so that this works as expected by the higher
+ * layers.
+ */
+int dax_flush_mapping(struct address_space *mapping, loff_t start, loff_t end)
+{
+	struct inode *inode = mapping->host;
+	pgoff_t indices[PAGEVEC_SIZE];
+	struct pagevec pvec;
+	int i, error;
+
+	pgoff_t start_page = start >> PAGE_CACHE_SHIFT;
+	pgoff_t end_page = end >> PAGE_CACHE_SHIFT;
+
+
+	if (mapping->nrdax == 0)
+		return 0;
+
+	if (!inode->i_op->get_block) {
+		WARN_ONCE(1, "Flushing DAX mapping without get_block()!");
+		mapping->nrdax = 0;
+		return 0;
+	}
+
+	BUG_ON(inode->i_blkbits != PAGE_SHIFT);
+
+	tag_pages_for_writeback(mapping, start_page, end_page);
+
+	pagevec_init(&pvec, 0);
+	while (1) {
+		pvec.nr = find_get_entries_tag(mapping, start_page,
+				PAGECACHE_TAG_TOWRITE, PAGEVEC_SIZE,
+				pvec.pages, indices);
+
+		if (pvec.nr == 0)
+			break;
+
+		for (i = 0; i < pvec.nr; i++) {
+			error = dax_flush_one_mapping(mapping, inode,
+					indices[i], pvec.pages[i]);
+			if (error)
+				return error;
+		}
+	}
+
+	return 0;
+}

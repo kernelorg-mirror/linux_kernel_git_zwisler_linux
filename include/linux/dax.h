@@ -41,4 +41,5 @@ static inline bool dax_mapping(struct address_space *mapping)
 {
 	return mapping->host && IS_DAX(mapping->host);
 }
+int dax_flush_mapping(struct address_space *mapping, loff_t start, loff_t end);
 #endif

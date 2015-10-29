@@ -37,6 +37,7 @@
 #include <linux/timer.h>
 #include <linux/sched/rt.h>
 #include <linux/mm_inline.h>
+#include <linux/dax.h>
 #include <trace/events/writeback.h>
 
 #include "internal.h"
@@ -2338,6 +2339,14 @@ int do_writepages(struct address_space *mapping, struct writeback_control *wbc)
 
 	if (wbc->nr_to_write <= 0)
 		return 0;
+
+	if (wbc->sync_mode == WB_SYNC_ALL && dax_mapping(mapping)) {
+		ret = dax_flush_mapping(mapping, wbc->range_start,
+				wbc->range_end);
+		if (ret)
+			return ret;
+	}
+
 	if (mapping->a_ops->writepages)
 		ret = mapping->a_ops->writepages(mapping, wbc);
 	else
