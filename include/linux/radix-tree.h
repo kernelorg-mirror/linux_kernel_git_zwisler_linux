@@ -51,6 +51,9 @@
 #define RADIX_TREE_EXCEPTIONAL_ENTRY	2
 #define RADIX_TREE_EXCEPTIONAL_SHIFT	2
 
+#define RADIX_TREE_DAX_PTE  ((void *)(0x10 | RADIX_TREE_EXCEPTIONAL_ENTRY))
+#define RADIX_TREE_DAX_PMD  ((void *)(0x20 | RADIX_TREE_EXCEPTIONAL_ENTRY))
+
 static inline int radix_tree_is_indirect_ptr(void *ptr)
 {
 	return (int)((unsigned long)ptr & RADIX_TREE_INDIRECT_PTR);

@@ -9,6 +9,7 @@
 
 #include <linux/kernel.h>
 #include <linux/backing-dev.h>
+#include <linux/dax.h>
 #include <linux/gfp.h>
 #include <linux/mm.h>
 #include <linux/swap.h>
@@ -29,8 +30,8 @@ static void clear_exceptional_entry(struct address_space *mapping,
 	struct radix_tree_node *node;
 	void **slot;
 
-	/* Handled by shmem itself */
-	if (shmem_mapping(mapping))
+	/* Handled by shmem or DAX directly */
+	if (shmem_mapping(mapping) || dax_mapping(mapping))
 		return;
 
 	spin_lock_irq(&mapping->tree_lock);
