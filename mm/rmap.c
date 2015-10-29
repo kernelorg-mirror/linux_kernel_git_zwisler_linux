@@ -586,6 +586,16 @@ vma_address(struct page *page, struct vm_area_struct *vma)
 	return address;
 }
 
+static inline unsigned long
+pgoff_address(pgoff_t pgoff, struct vm_area_struct *vma)
+{
+	unsigned long address;
+
+	address = vma->vm_start + ((pgoff - vma->vm_pgoff) << PAGE_SHIFT);
+	VM_BUG_ON_VMA(address < vma->vm_start || address >= vma->vm_end, vma);
+	return address;
+}
+
 #ifdef CONFIG_ARCH_WANT_BATCHED_UNMAP_TLB_FLUSH
 static void percpu_flush_tlb_batch_pages(void *data)
 {
@@ -1039,6 +1049,49 @@ int page_mkclean(struct page *page)
 	return cleaned;
 }
 EXPORT_SYMBOL_GPL(page_mkclean);
+
+int pgoff_mkclean(pgoff_t pgoff, struct address_space *mapping)
+{
+	struct vm_area_struct *vma;
+	int ret = 0;
+
+	i_mmap_lock_read(mapping);
+	vma_interval_tree_foreach(vma, &mapping->i_mmap, pgoff, pgoff) {
+		struct mm_struct *mm = vma->vm_mm;
+		pmd_t pmd, *pmdp = NULL;
+		pte_t pte, *ptep = NULL;
+		unsigned long address;
+		spinlock_t *ptl;
+
+		address = pgoff_address(pgoff, vma);
+
+		ret = follow_pte_pmd(mm, address, &ptep, &pmdp, &ptl);
+		if (ret)
+			goto out;
+
+		if (pmdp) {
+			flush_cache_page(vma, address, pmd_pfn(*pmdp));
+			pmd = pmdp_huge_clear_flush(vma, address, pmdp);
+			pmd = pmd_wrprotect(pmd);
+			pmd = pmd_mkclean(pmd);
+			set_pmd_at(mm, address, pmdp, pmd);
+			spin_unlock(ptl);
+		} else {
+			BUG_ON(!ptep);
+			flush_cache_page(vma, address, pte_pfn(*ptep));
+			pte = ptep_clear_flush(vma, address, ptep);
+			pte = pte_wrprotect(pte);
+			pte = pte_mkclean(pte);
+			set_pte_at(mm, address, ptep, pte);
+			pte_unmap_unlock(ptep, ptl);
+		}
+	}
+
+ out:
+	i_mmap_unlock_read(mapping);
+	return ret;
+}
+EXPORT_SYMBOL_GPL(pgoff_mkclean);
 
 /**
  * page_move_anon_rmap - move a page to our anon_vma
