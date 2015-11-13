@@ -51,6 +51,14 @@
 #define RADIX_TREE_EXCEPTIONAL_ENTRY	2
 #define RADIX_TREE_EXCEPTIONAL_SHIFT	2
 
+#define RADIX_DAX_MASK	0xf
+#define RADIX_DAX_PTE  (0x4 | RADIX_TREE_EXCEPTIONAL_ENTRY)
+#define RADIX_DAX_PMD  (0x8 | RADIX_TREE_EXCEPTIONAL_ENTRY)
+#define RADIX_DAX_TYPE(entry) ((__force u64)entry & RADIX_DAX_MASK)
+#define RADIX_DAX_ADDR(entry) ((void __pmem *)((u64)entry & ~RADIX_DAX_MASK))
+#define RADIX_DAX_PTE_ENTRY(addr) ((void *)((__force u64)addr | RADIX_DAX_PTE))
+#define RADIX_DAX_PMD_ENTRY(addr) ((void *)((__force u64)addr | RADIX_DAX_PMD))
+
 static inline int radix_tree_is_indirect_ptr(void *ptr)
 {
 	return (int)((unsigned long)ptr & RADIX_TREE_INDIRECT_PTR);
