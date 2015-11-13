@@ -24,7 +24,9 @@
 #include <linux/memcontrol.h>
 #include <linux/mm.h>
 #include <linux/mutex.h>
+#include <linux/pagevec.h>
 #include <linux/pmem.h>
+#include <linux/rmap.h>
 #include <linux/sched.h>
 #include <linux/uio.h>
 #include <linux/vmstat.h>
@@ -287,6 +289,53 @@ static int copy_user_bh(struct page *to, struct buffer_head *bh,
 	return 0;
 }
 
+static int dax_dirty_pgoff(struct address_space *mapping, unsigned long pgoff,
+		void __pmem *addr, bool pmd_entry)
+{
+	struct radix_tree_root *page_tree = &mapping->page_tree;
+	int error = 0;
+	void *entry;
+
+	__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
+
+	spin_lock_irq(&mapping->tree_lock);
+	entry = radix_tree_lookup(page_tree, pgoff);
+	if (addr == NULL) {
+		if (entry)
+			goto dirty;
+		else {
+			WARN(1, "DAX pfn_mkwrite failed to find an entry");
+			goto out;
+		}
+	}
+
+	if (entry) {
+		if (pmd_entry && RADIX_DAX_TYPE(entry) == RADIX_DAX_PTE) {
+			radix_tree_delete(&mapping->page_tree, pgoff);
+			mapping->nrdax--;
+		} else
+			goto dirty;
+	}
+
+	BUG_ON(RADIX_DAX_TYPE(addr));
+	if (pmd_entry)
+		error = radix_tree_insert(page_tree, pgoff,
+				RADIX_DAX_PMD_ENTRY(addr));
+	else
+		error = radix_tree_insert(page_tree, pgoff,
+				RADIX_DAX_PTE_ENTRY(addr));
+
+	if (error)
+		goto out;
+
+	mapping->nrdax++;
+ dirty:
+	radix_tree_tag_set(page_tree, pgoff, PAGECACHE_TAG_DIRTY);
+ out:
+	spin_unlock_irq(&mapping->tree_lock);
+	return error;
+}
+
 static int dax_insert_mapping(struct inode *inode, struct buffer_head *bh,
 			struct vm_area_struct *vma, struct vm_fault *vmf)
 {
@@ -327,7 +376,10 @@ static int dax_insert_mapping(struct inode *inode, struct buffer_head *bh,
 	}
 
 	error = vm_insert_mixed(vma, vaddr, pfn);
+	if (error)
+		goto out;
 
+	error = dax_dirty_pgoff(mapping, vmf->pgoff, addr, false);
  out:
 	i_mmap_unlock_read(mapping);
 
@@ -450,6 +502,7 @@ int __dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		delete_from_page_cache(page);
 		unlock_page(page);
 		page_cache_release(page);
+		page = NULL;
 	}
 
 	/*
@@ -537,7 +590,7 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 	pgoff_t size, pgoff;
 	sector_t block, sector;
 	unsigned long pfn;
-	int result = 0;
+	int error, result = 0;
 
 	/* Fall back to PTEs if we're going to COW */
 	if (write && !(vma->vm_flags & VM_SHARED))
@@ -638,6 +691,10 @@ int __dax_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		}
 
 		result |= vmf_insert_pfn_pmd(vma, address, pmd, pfn, write);
+
+		error = dax_dirty_pgoff(mapping, pgoff, kaddr, true);
+		if (error)
+			goto fallback;
 	}
 
  out:
@@ -689,15 +746,12 @@ EXPORT_SYMBOL_GPL(dax_pmd_fault);
  * dax_pfn_mkwrite - handle first write to DAX page
  * @vma: The virtual memory area where the fault occurred
  * @vmf: The description of the fault
- *
  */
 int dax_pfn_mkwrite(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
-	struct super_block *sb = file_inode(vma->vm_file)->i_sb;
+	struct file *file = vma->vm_file;
 
-	sb_start_pagefault(sb);
-	file_update_time(vma->vm_file);
-	sb_end_pagefault(sb);
+	dax_dirty_pgoff(file->f_mapping, vmf->pgoff, NULL, false);
 	return VM_FAULT_NOPAGE;
 }
 EXPORT_SYMBOL_GPL(dax_pfn_mkwrite);
@@ -772,3 +826,77 @@ int dax_truncate_page(struct inode *inode, loff_t from, get_block_t get_block)
 	return dax_zero_page_range(inode, from, length, get_block);
 }
 EXPORT_SYMBOL_GPL(dax_truncate_page);
+
+static void dax_sync_entry(struct address_space *mapping, pgoff_t pgoff,
+		void *entry)
+{
+	struct radix_tree_root *page_tree = &mapping->page_tree;
+	int type = RADIX_DAX_TYPE(entry);
+	size_t size;
+
+	BUG_ON(type != RADIX_DAX_PTE && type != RADIX_DAX_PMD);
+
+	spin_lock_irq(&mapping->tree_lock);
+	if (!radix_tree_tag_get(page_tree, pgoff, PAGECACHE_TAG_TOWRITE)) {
+		/* another fsync thread already wrote back this entry */
+		spin_unlock_irq(&mapping->tree_lock);
+		return;
+	}
+	radix_tree_tag_clear(page_tree, pgoff, PAGECACHE_TAG_TOWRITE);
+	radix_tree_tag_clear(page_tree, pgoff, PAGECACHE_TAG_DIRTY);
+	spin_unlock_irq(&mapping->tree_lock);
+
+	if (type == RADIX_DAX_PMD)
+		size = PMD_SIZE;
+	else
+		size = PAGE_SIZE;
+
+	wb_cache_pmem(RADIX_DAX_ADDR(entry), size);
+	pgoff_mkclean(pgoff, mapping);
+}
+
+/*
+ * Flush the mapping to the persistent domain within the byte range of (start,
+ * end). This is required by data integrity operations to ensure file data is on
+ * persistent storage prior to completion of the operation. It also requires us
+ * to clean the mappings (i.e. write -> RO) so that we'll get a new fault when
+ * the file is written to again so we have an indication that we need to flush
+ * the mapping if a data integrity operation takes place.
+ *
+ * We don't need commits to storage here - the filesystems will issue flushes
+ * appropriately at the conclusion of the data integrity operation via REQ_FUA
+ * writes or blkdev_issue_flush() commands.  This requires the DAX block device
+ * to implement persistent storage domain fencing/commits on receiving a
+ * REQ_FLUSH or REQ_FUA request so that this works as expected by the higher
+ * layers.
+ */
+void dax_fsync(struct address_space *mapping, loff_t start, loff_t end)
+{
+	struct inode *inode = mapping->host;
+	pgoff_t indices[PAGEVEC_SIZE];
+	struct pagevec pvec;
+	int i;
+
+	pgoff_t start_page = start >> PAGE_CACHE_SHIFT;
+	pgoff_t end_page = end >> PAGE_CACHE_SHIFT;
+
+	if (mapping->nrdax == 0)
+		return;
+
+	BUG_ON(inode->i_blkbits != PAGE_SHIFT);
+
+	tag_pages_for_writeback(mapping, start_page, end_page);
+
+	pagevec_init(&pvec, 0);
+	while (1) {
+		pvec.nr = find_get_entries_tag(mapping, start_page,
+				PAGECACHE_TAG_TOWRITE, PAGEVEC_SIZE,
+				pvec.pages, indices);
+
+		if (pvec.nr == 0)
+			break;
+
+		for (i = 0; i < pvec.nr; i++)
+			dax_sync_entry(mapping, indices[i], pvec.pages[i]);
+	}
+}
