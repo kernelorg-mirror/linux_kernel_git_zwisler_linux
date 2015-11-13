@@ -27,6 +27,7 @@
 #include <linux/sched.h>
 #include <linux/writeback.h>
 #include <linux/blkdev.h>
+#include <linux/dax.h>
 
 #include "ext4.h"
 #include "ext4_jbd2.h"
@@ -86,7 +87,8 @@ static int ext4_sync_parent(struct inode *inode)
 
 int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 {
-	struct inode *inode = file->f_mapping->host;
+	struct address_space *mapping = file->f_mapping;
+	struct inode *inode = mapping->host;
 	struct ext4_inode_info *ei = EXT4_I(inode);
 	journal_t *journal = EXT4_SB(inode->i_sb)->s_journal;
 	int ret = 0, err;
@@ -112,7 +114,13 @@ int ext4_sync_file(struct file *file, loff_t start, loff_t end, int datasync)
 		goto out;
 	}
 
-	ret = filemap_write_and_wait_range(inode->i_mapping, start, end);
+	if (dax_mapping(mapping)) {
+		down_read(&ei->i_mmap_sem);
+		dax_fsync(mapping, start, end);
+		up_read(&ei->i_mmap_sem);
+	}
+
+	ret = filemap_write_and_wait_range(mapping, start, end);
 	if (ret)
 		return ret;
 	/*
