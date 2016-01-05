@@ -563,7 +563,12 @@ static void __dax_dbg(struct buffer_head *bh, unsigned long address,
 {
 	if (bh) {
 		char bname[BDEVNAME_SIZE];
-		bdevname(bh->b_bdev, bname);
+
+		if (bh->b_bdev)
+			bdevname(bh->b_bdev, bname);
+		else
+			snprintf(bname, BDEVNAME_SIZE, "unknown");
+
 		pr_debug("%s: %s addr: %lx dev %s state %lx start %lld "
 			"length %zd fallback: %s\n", fn, current->comm,
 			address, bname, bh->b_state, (u64)bh->b_blocknr,
