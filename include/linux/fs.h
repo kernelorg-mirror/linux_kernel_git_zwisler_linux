@@ -830,7 +830,14 @@ static inline unsigned imajor(const struct inode *inode)
 	return MAJOR(inode->i_rdev);
 }
 
+#ifdef CONFIG_BLOCK
 extern struct block_device *I_BDEV(struct inode *inode);
+#else
+static inline struct block_device *I_BDEV(struct inode *inode)
+{
+	return NULL;
+}
+#endif
 
 struct fown_struct {
 	rwlock_t lock;          /* protects pid, uid, euid fields */
@@ -2306,15 +2313,6 @@ extern struct super_block *freeze_bdev(struct block_device *);
 extern void emergency_thaw_all(void);
 extern int thaw_bdev(struct block_device *bdev, struct super_block *sb);
 extern int fsync_bdev(struct block_device *);
-#ifdef CONFIG_FS_DAX
-extern bool blkdev_dax_capable(struct block_device *bdev);
-#else
-static inline bool blkdev_dax_capable(struct block_device *bdev)
-{
-	return false;
-}
-#endif
-
 extern struct super_block *blockdev_superblock;
 
 static inline bool sb_is_blkdev_sb(struct super_block *sb)
@@ -2902,9 +2900,22 @@ extern int generic_show_options(struct seq_file *m, struct dentry *root);
 extern void save_mount_options(struct super_block *sb, char *options);
 extern void replace_mount_options(struct super_block *sb, char *options);
 
+#ifdef CONFIG_FS_DAX
+extern bool blkdev_dax_capable(struct block_device *bdev);
+#else
+static inline bool blkdev_dax_capable(struct block_device *bdev)
+{
+	return false;
+}
+#endif
+
 static inline bool io_is_direct(struct file *filp)
 {
-	return (filp->f_flags & O_DIRECT) || IS_DAX(filp->f_mapping->host);
+	struct inode *inode = filp->f_mapping->host;
+
+	return (filp->f_flags & O_DIRECT) || IS_DAX(inode)
+		|| (S_ISBLK(file_inode(filp)->i_mode)
+				&& blkdev_dax_capable(I_BDEV(inode)));
 }
 
 static inline int iocb_flags(struct file *file)

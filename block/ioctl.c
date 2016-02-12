@@ -434,6 +434,7 @@ bool blkdev_dax_capable(struct block_device *bdev)
 
 	return true;
 }
+EXPORT_SYMBOL(blkdev_dax_capable);
 #endif
 
 static int blkdev_flushbuf(struct block_device *bdev, fmode_t mode,
