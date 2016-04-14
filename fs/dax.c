@@ -40,6 +40,7 @@
 #define RADIX_DAX_SECTOR(entry) (((unsigned long)entry >> RADIX_DAX_SHIFT))
 #define RADIX_DAX_ENTRY(sector, pmd) ((void *)((unsigned long)sector << \
 		RADIX_DAX_SHIFT | (pmd ? RADIX_DAX_PMD : RADIX_DAX_PTE)))
+#define RADIX_DAX_ORDER(pmd) (pmd ? PMD_SHIFT - PAGE_SHIFT : 0)
 
 static long dax_map_atomic(struct block_device *bdev, struct blk_dax_ctl *dax)
 {
@@ -360,13 +361,11 @@ static int copy_user_bh(struct page *to, struct inode *inode,
 }
 
 #define NO_SECTOR -1
-#define DAX_PMD_INDEX(page_index) (page_index & (PMD_MASK >> PAGE_CACHE_SHIFT))
 
 static int dax_radix_entry(struct address_space *mapping, pgoff_t index,
 		sector_t sector, bool pmd_entry, bool dirty)
 {
 	struct radix_tree_root *page_tree = &mapping->page_tree;
-	pgoff_t pmd_index = DAX_PMD_INDEX(index);
 	int type, error = 0;
 	void *entry;
 
@@ -375,12 +374,6 @@ static int dax_radix_entry(struct address_space *mapping, pgoff_t index,
 		__mark_inode_dirty(mapping->host, I_DIRTY_PAGES);
 
 	spin_lock_irq(&mapping->tree_lock);
-
-	entry = radix_tree_lookup(page_tree, pmd_index);
-	if (entry && RADIX_DAX_TYPE(entry) == RADIX_DAX_PMD) {
-		index = pmd_index;
-		goto dirty;
-	}
 
 	entry = radix_tree_lookup(page_tree, index);
 	if (entry) {
@@ -418,7 +411,8 @@ static int dax_radix_entry(struct address_space *mapping, pgoff_t index,
 		goto unlock;
 	}
 
-	error = radix_tree_insert(page_tree, index,
+	error = __radix_tree_insert(page_tree, index,
+			RADIX_DAX_ORDER(pmd_entry),
 			RADIX_DAX_ENTRY(sector, pmd_entry));
 	if (error)
 		goto unlock;
@@ -462,6 +456,13 @@ static int dax_writeback_one(struct block_device *bdev,
 		goto unlock;
 	}
 
+	/*
+	 * Even if dax_writeback_mapping_range() was given a wbc->range_start
+	 * in the middle of a PMD, the 'index' we are given will be aligned to
+	 * the start index of the PMD, as will the sector we pull from
+	 * 'entry'.  This allows us to flush for PMD_SIZE and not have to
+	 * worry about partial PMD writebacks.
+	 */
 	dax.sector = RADIX_DAX_SECTOR(entry);
 	dax.size = (type == RADIX_DAX_PMD ? PMD_SIZE : PAGE_SIZE);
 	spin_unlock_irq(&mapping->tree_lock);
@@ -502,12 +503,11 @@ int dax_writeback_mapping_range(struct address_space *mapping,
 		struct block_device *bdev, struct writeback_control *wbc)
 {
 	struct inode *inode = mapping->host;
-	pgoff_t start_index, end_index, pmd_index;
+	pgoff_t start_index, end_index;
 	pgoff_t indices[PAGEVEC_SIZE];
 	struct pagevec pvec;
 	bool done = false;
 	int i, ret = 0;
-	void *entry;
 
 	if (WARN_ON_ONCE(inode->i_blkbits != PAGE_SHIFT))
 		return -EIO;
@@ -517,15 +517,6 @@ int dax_writeback_mapping_range(struct address_space *mapping,
 
 	start_index = wbc->range_start >> PAGE_CACHE_SHIFT;
 	end_index = wbc->range_end >> PAGE_CACHE_SHIFT;
-	pmd_index = DAX_PMD_INDEX(start_index);
-
-	rcu_read_lock();
-	entry = radix_tree_lookup(&mapping->page_tree, pmd_index);
-	rcu_read_unlock();
-
-	/* see if the start of our range is covered by a PMD entry */
-	if (entry && RADIX_DAX_TYPE(entry) == RADIX_DAX_PMD)
-		start_index = pmd_index;
 
 	tag_pages_for_writeback(mapping, start_index, end_index);
 
