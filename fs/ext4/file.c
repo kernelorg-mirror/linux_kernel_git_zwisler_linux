@@ -161,7 +161,8 @@ ext4_file_write_iter(struct kiocb *iocb, struct iov_iter *from)
 
 	iocb->private = &overwrite;
 	/* Check whether we do a DIO overwrite or not */
-	if (o_direct && ext4_should_dioread_nolock(inode) && !unaligned_aio &&
+	if (((o_direct && !unaligned_aio) || IS_DAX(inode)) &&
+	    ext4_should_dioread_nolock(inode) &&
 	    ext4_overwrite_io(inode, iocb->ki_pos, iov_iter_count(from)))
 		overwrite = 1;
 
