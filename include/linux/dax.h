@@ -21,7 +21,7 @@ int iomap_dax_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 			struct iomap_ops *ops);
 int dax_fault(struct vm_area_struct *, struct vm_fault *, get_block_t);
 int dax_delete_mapping_entry(struct address_space *mapping, pgoff_t index);
-void dax_wake_mapping_entry_waiter(struct address_space *mapping,
+void dax_wake_mapping_entry_waiter(void *entry, struct address_space *mapping,
 				   pgoff_t index, bool wake_all);
 
 #ifdef CONFIG_FS_DAX
