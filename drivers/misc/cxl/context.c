@@ -117,7 +117,7 @@ int cxl_context_init(struct cxl_context *ctx, struct cxl_afu *afu, bool master,
 static int cxl_mmap_fault(struct vm_area_struct *vma, struct vm_fault *vmf)
 {
 	struct cxl_context *ctx = vma->vm_file->private_data;
-	unsigned long address = (unsigned long)vmf->virtual_address;
+	unsigned long address = vmf->address & PAGE_MASK;
 	u64 area, offset;
 
 	offset = vmf->pgoff << PAGE_SHIFT;
