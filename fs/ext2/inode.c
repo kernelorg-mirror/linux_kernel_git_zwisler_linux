@@ -830,8 +830,10 @@ ext2_iomap_end(struct inode *inode, loff_t offset, loff_t length,
 {
 	if (iomap->type == IOMAP_MAPPED &&
 	    written < length &&
-	    (flags & IOMAP_WRITE))
+	    (flags & IOMAP_WRITE)) {
 		ext2_write_failed(inode->i_mapping, offset + length);
+		return -EIO;
+	}
 	return 0;
 }
 
