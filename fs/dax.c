@@ -1077,6 +1077,15 @@ dax_iomap_rw(struct kiocb *iocb, struct iov_iter *iter,
 }
 EXPORT_SYMBOL_GPL(dax_iomap_rw);
 
+static int dax_fault_return(int error)
+{
+	if (error == 0)
+		return VM_FAULT_NOPAGE;
+	if (error == -ENOMEM)
+		return VM_FAULT_OOM;
+	return VM_FAULT_SIGBUS;
+}
+
 /**
  * dax_iomap_fault - handle a page fault on a DAX file
  * @vma: The virtual memory area where the fault occurred
@@ -1109,12 +1118,6 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 	if (pos >= i_size_read(inode))
 		return VM_FAULT_SIGBUS;
 
-	entry = grab_mapping_entry(mapping, vmf->pgoff, 0);
-	if (IS_ERR(entry)) {
-		error = PTR_ERR(entry);
-		goto out;
-	}
-
 	if ((vmf->flags & FAULT_FLAG_WRITE) && !vmf->cow_page)
 		flags |= IOMAP_WRITE;
 
@@ -1125,9 +1128,15 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 	 */
 	error = ops->iomap_begin(inode, pos, PAGE_SIZE, flags, &iomap);
 	if (error)
-		goto unlock_entry;
+		return dax_fault_return(error);
 	if (WARN_ON_ONCE(iomap.offset + iomap.length < pos + PAGE_SIZE)) {
-		error = -EIO;		/* fs corruption? */
+		vmf_ret = dax_fault_return(-EIO);	/* fs corruption? */
+		goto finish_iomap;
+	}
+
+	entry = grab_mapping_entry(mapping, vmf->pgoff, 0);
+	if (IS_ERR(entry)) {
+		vmf_ret = dax_fault_return(PTR_ERR(entry));
 		goto finish_iomap;
 	}
 
@@ -1150,7 +1159,7 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		}
 
 		if (error)
-			goto finish_iomap;
+			goto error_unlock_entry;
 
 		__SetPageUptodate(vmf->cow_page);
 		if (!radix_tree_exceptional_entry(entry))
@@ -1159,7 +1168,7 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		if (!vmf_ret)
 			vmf_ret = VM_FAULT_DONE_COW;
 		vmf->page = NULL;
-		goto finish_iomap;
+		goto unlock_entry;
 	}
 
 	switch (iomap.type) {
@@ -1171,12 +1180,15 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		}
 		error = dax_insert_mapping(mapping, iomap.bdev, sector,
 				PAGE_SIZE, &entry, vma, vmf);
+		/* -EBUSY is fine, somebody else faulted on the same PTE */
+		if (error == -EBUSY)
+			error = 0;
 		break;
 	case IOMAP_UNWRITTEN:
 	case IOMAP_HOLE:
 		if (!(vmf->flags & FAULT_FLAG_WRITE)) {
 			vmf_ret = dax_load_hole(mapping, &entry, vmf);
-			goto finish_iomap;
+			goto unlock_entry;
 		}
 		/*FALLTHRU*/
 	default:
@@ -1185,30 +1197,25 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		break;
 	}
 
- finish_iomap:
-	if (ops->iomap_end) {
-		if (error || (vmf_ret & VM_FAULT_ERROR)) {
-			/* keep previous error */
-			ops->iomap_end(inode, pos, PAGE_SIZE, 0, flags,
-					&iomap);
-		} else {
-			error = ops->iomap_end(inode, pos, PAGE_SIZE,
-					PAGE_SIZE, flags, &iomap);
-		}
-	}
+ error_unlock_entry:
+	vmf_ret = dax_fault_return(error) | major;
  unlock_entry:
 	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
- out:
-	if (error == -ENOMEM)
-		return VM_FAULT_OOM | major;
-	/* -EBUSY is fine, somebody else faulted on the same PTE */
-	if (error < 0 && error != -EBUSY)
-		return VM_FAULT_SIGBUS | major;
-	if (vmf_ret) {
-		WARN_ON_ONCE(error); /* -EBUSY from ops->iomap_end? */
-		return vmf_ret;
+ finish_iomap:
+	if (ops->iomap_end) {
+		int copied = PAGE_SIZE;
+
+		if (vmf_ret & VM_FAULT_ERROR)
+			copied = 0;
+		/*
+		 * The fault is done by now and there's no way back (other
+		 * thread may be already happily using PTE we have installed).
+		 * Just ignore error from ->iomap_end since we cannot do much
+		 * with it.
+		 */
+		ops->iomap_end(inode, pos, PAGE_SIZE, copied, flags, &iomap);
 	}
-	return VM_FAULT_NOPAGE | major;
+	return vmf_ret;
 }
 EXPORT_SYMBOL_GPL(dax_iomap_fault);
 
@@ -1335,16 +1342,6 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		goto fallback;
 
 	/*
-	 * grab_mapping_entry() will make sure we get a 2M empty entry, a DAX
-	 * PMD or a HZP entry.  If it can't (because a 4k page is already in
-	 * the tree, for instance), it will return -EEXIST and we just fall
-	 * back to 4k entries.
-	 */
-	entry = grab_mapping_entry(mapping, pgoff, RADIX_DAX_PMD);
-	if (IS_ERR(entry))
-		goto fallback;
-
-	/*
 	 * Note that we don't use iomap_apply here.  We aren't doing I/O, only
 	 * setting up a mapping, so really we're using iomap_begin() as a way
 	 * to look up our filesystem block.
@@ -1352,9 +1349,19 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 	pos = (loff_t)pgoff << PAGE_SHIFT;
 	error = ops->iomap_begin(inode, pos, PMD_SIZE, iomap_flags, &iomap);
 	if (error)
-		goto unlock_entry;
-	if (iomap.offset + iomap.length < pos + PMD_SIZE)
+		goto fallback;
+	/*
+	 * grab_mapping_entry() will make sure we get a 2M empty entry, a DAX
+	 * PMD or a HZP entry.  If it can't (because a 4k page is already in
+	 * the tree, for instance), it will return -EEXIST and we just fall
+	 * back to 4k entries.
+	 */
+	entry = grab_mapping_entry(mapping, pgoff, RADIX_DAX_PMD);
+	if (IS_ERR(entry))
 		goto finish_iomap;
+
+	if (iomap.offset + iomap.length < pos + PMD_SIZE)
+		goto unlock_entry;
 
 	vmf.pgoff = pgoff;
 	vmf.flags = flags;
@@ -1368,7 +1375,7 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 	case IOMAP_UNWRITTEN:
 	case IOMAP_HOLE:
 		if (WARN_ON_ONCE(write))
-			goto finish_iomap;
+			goto unlock_entry;
 		result = dax_pmd_load_hole(vma, pmd, &vmf, address, &iomap,
 				&entry);
 		break;
@@ -1377,20 +1384,23 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		break;
 	}
 
- finish_iomap:
-	if (ops->iomap_end) {
-		if (result == VM_FAULT_FALLBACK) {
-			ops->iomap_end(inode, pos, PMD_SIZE, 0, iomap_flags,
-					&iomap);
-		} else {
-			error = ops->iomap_end(inode, pos, PMD_SIZE, PMD_SIZE,
-					iomap_flags, &iomap);
-			if (error)
-				result = VM_FAULT_FALLBACK;
-		}
-	}
  unlock_entry:
 	put_locked_mapping_entry(mapping, pgoff, entry);
+ finish_iomap:
+	if (ops->iomap_end) {
+		int copied = PMD_SIZE;
+
+		if (result == VM_FAULT_FALLBACK)
+			copied = 0;
+		/*
+		 * The fault is done by now and there's no way back (other
+		 * thread may be already happily using PMD we have installed).
+		 * Just ignore error from ->iomap_end since we cannot do much
+		 * with it.
+		 */
+		ops->iomap_end(inode, pos, PMD_SIZE, copied, iomap_flags,
+				&iomap);
+	}
  fallback:
 	if (result == VM_FAULT_FALLBACK)
 		count_vm_event(THP_FAULT_FALLBACK);
