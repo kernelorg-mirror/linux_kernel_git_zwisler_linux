@@ -3272,6 +3272,7 @@ static inline bool ext4_aligned_io(struct inode *inode, loff_t off, loff_t len)
 }
 
 extern struct iomap_ops ext4_iomap_ops;
+extern struct iomap_ops ext4_iomap_fault_ops;
 
 #endif	/* __KERNEL__ */
 

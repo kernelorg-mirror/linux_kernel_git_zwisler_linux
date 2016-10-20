@@ -3419,9 +3419,27 @@ static int ext4_iomap_end(struct inode *inode, loff_t offset, loff_t length,
 	return 0;
 }
 
+/*
+ * For faults we don't allocate any blocks outside of isize and we don't want
+ * to change it so we use a dedicated function for it...
+ */
+static int ext4_iomap_fault_end(struct inode *inode, loff_t offset,
+				loff_t length, ssize_t written, unsigned flags,
+				struct iomap *iomap)
+{
+	if (flags & IOMAP_WRITE)
+		ext4_journal_stop(ext4_journal_current_handle());
+	return 0;
+}
+
 struct iomap_ops ext4_iomap_ops = {
 	.iomap_begin		= ext4_iomap_begin,
 	.iomap_end		= ext4_iomap_end,
+};
+
+struct iomap_ops ext4_iomap_fault_ops = {
+	.iomap_begin		= ext4_iomap_begin,
+	.iomap_end		= ext4_iomap_fault_end,
 };
 
 #else
