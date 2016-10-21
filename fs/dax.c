@@ -422,7 +422,7 @@ restart:
 		return page;
 	}
 	entry = lock_slot(mapping, slot);
- out_unlock:
+out_unlock:
 	spin_unlock_irq(&mapping->tree_lock);
 	return entry;
 }
@@ -557,7 +557,7 @@ static int dax_load_hole(struct address_space *mapping, void **entry,
 				   vmf->gfp_mask | __GFP_ZERO);
 	if (!page)
 		return VM_FAULT_OOM;
- out:
+out:
 	vmf->page = page;
 	ret = finish_fault(vmf);
 	vmf->page = NULL;
@@ -659,7 +659,7 @@ static void *dax_insert_mapping_entry(struct address_space *mapping,
 	}
 	if (vmf->flags & FAULT_FLAG_WRITE)
 		radix_tree_tag_set(page_tree, index, PAGECACHE_TAG_DIRTY);
- unlock:
+unlock:
 	spin_unlock_irq(&mapping->tree_lock);
 	if (hole_fill) {
 		radix_tree_preload_end();
@@ -812,12 +812,12 @@ static int dax_writeback_one(struct block_device *bdev,
 	spin_lock_irq(&mapping->tree_lock);
 	radix_tree_tag_clear(page_tree, index, PAGECACHE_TAG_DIRTY);
 	spin_unlock_irq(&mapping->tree_lock);
- unmap:
+unmap:
 	dax_unmap_atomic(bdev, &dax);
 	put_locked_mapping_entry(mapping, index, entry);
 	return ret;
 
- put_unlocked:
+put_unlocked:
 	put_unlocked_mapping_entry(mapping, index, entry2);
 	spin_unlock_irq(&mapping->tree_lock);
 	return ret;
@@ -1194,11 +1194,11 @@ int dax_iomap_fault(struct vm_area_struct *vma, struct vm_fault *vmf,
 		break;
 	}
 
- error_unlock_entry:
+error_unlock_entry:
 	vmf_ret = dax_fault_return(error) | major;
- unlock_entry:
+unlock_entry:
 	put_locked_mapping_entry(mapping, vmf->pgoff, entry);
- finish_iomap:
+finish_iomap:
 	if (ops->iomap_end) {
 		int copied = PAGE_SIZE;
 
@@ -1255,7 +1255,7 @@ static int dax_pmd_insert_mapping(struct vm_area_struct *vma, pmd_t *pmd,
 
 	return vmf_insert_pfn_pmd(vma, address, pmd, dax.pfn, write);
 
- unmap_fallback:
+unmap_fallback:
 	dax_unmap_atomic(bdev, &dax);
 	return VM_FAULT_FALLBACK;
 }
@@ -1379,9 +1379,9 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		break;
 	}
 
- unlock_entry:
+unlock_entry:
 	put_locked_mapping_entry(mapping, pgoff, entry);
- finish_iomap:
+finish_iomap:
 	if (ops->iomap_end) {
 		int copied = PMD_SIZE;
 
@@ -1396,7 +1396,7 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 		ops->iomap_end(inode, pos, PMD_SIZE, copied, iomap_flags,
 				&iomap);
 	}
- fallback:
+fallback:
 	if (result == VM_FAULT_FALLBACK) {
 		split_huge_pmd(vma, pmd, address);
 		count_vm_event(THP_FAULT_FALLBACK);
