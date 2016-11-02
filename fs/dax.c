@@ -1315,10 +1315,8 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 	int error;
 
 	/* Fall back to PTEs if we're going to COW */
-	if (write && !(vma->vm_flags & VM_SHARED)) {
-		split_huge_pmd(vma, pmd, address);
+	if (write && !(vma->vm_flags & VM_SHARED))
 		goto fallback;
-	}
 
 	/* If the PMD would extend outside the VMA */
 	if (pmd_addr < vma->vm_start)
@@ -1402,8 +1400,10 @@ int dax_iomap_pmd_fault(struct vm_area_struct *vma, unsigned long address,
 				&iomap);
 	}
  fallback:
-	if (result == VM_FAULT_FALLBACK)
+	if (result == VM_FAULT_FALLBACK) {
+		split_huge_pmd(vma, pmd, address);
 		count_vm_event(THP_FAULT_FALLBACK);
+	}
 	return result;
 }
 EXPORT_SYMBOL_GPL(dax_iomap_pmd_fault);
