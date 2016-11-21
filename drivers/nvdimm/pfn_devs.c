@@ -527,10 +527,38 @@ static struct vmem_altmap *__nvdimm_setup_pfn(struct nd_pfn *nd_pfn,
 		.base_pfn = init_altmap_base(base),
 		.reserve = init_altmap_reserve(base),
 	};
+	sector_t sector;
+	resource_size_t meta_start, meta_size;
+	long cleared;
+	unsigned int sz_align;
 
 	memcpy(res, &nsio->res, sizeof(*res));
 	res->start += start_pad;
 	res->end -= end_trunc;
+
+	meta_start = res->start + SZ_8K;
+	meta_size = offset - meta_start + 1;
+
+	if (meta_start + meta_size > offset)
+		return ERR_PTR(-EINVAL);
+
+	sector = meta_start >> 9;
+	sz_align = ALIGN(meta_size + (meta_start & (512 - 1)), 512);
+
+	if (unlikely(is_bad_pmem(&nsio->bb, sector, sz_align))) {
+		if (!IS_ALIGNED(meta_start, 512) ||
+		    !IS_ALIGNED(meta_size, 512))
+			return ERR_PTR(-EIO);
+
+		cleared = nvdimm_clear_poison(&nd_pfn->dev,
+					      meta_start, meta_size);
+		if (cleared <= 0)
+			return ERR_PTR(-EIO);
+
+		badblocks_clear(&nsio->bb, sector, cleared >> 9);
+		if (cleared != meta_size)
+			return ERR_PTR(-EIO);
+	}
 
 	if (nd_pfn->mode == PFN_MODE_RAM) {
 		if (offset < SZ_8K)
