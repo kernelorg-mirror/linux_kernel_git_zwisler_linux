@@ -67,6 +67,7 @@ static int pmem_clear_poison(struct pmem_device *pmem, phys_addr_t offset,
 				cleared > 1 ? "s" : "");
 		badblocks_clear(&pmem->bb, sector, cleared);
 	}
+
 	invalidate_pmem(pmem->virt_addr + offset, len);
 
 	return rc;
@@ -129,7 +130,7 @@ static int pmem_do_bvec(struct pmem_device *pmem, struct page *page,
 		flush_dcache_page(page);
 		write_pmem(pmem_addr, page, off, len);
 		if (unlikely(bad_pmem)) {
-			pmem_clear_poison(pmem, pmem_off, len);
+			rc = pmem_clear_poison(pmem, pmem_off, len);
 			write_pmem(pmem_addr, page, off, len);
 		}
 	}
