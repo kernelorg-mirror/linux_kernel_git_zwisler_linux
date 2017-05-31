@@ -6366,6 +6366,12 @@ S:	Supported
 F:	drivers/scsi/hisi_sas/
 F:	Documentation/devicetree/bindings/scsi/hisilicon-sas.txt
 
+HMAT - ACPI Heterogeneous Memory Attribute Table Support
+M:	Ross Zwisler <ross.zwisler@linux.intel.com>
+L:	linux-mm@kvack.org
+S:	Supported
+F:	drivers/acpi/hmat/
+
 HMM - Heterogeneous Memory Management
 M:	Jérôme Glisse <jglisse@redhat.com>
 L:	linux-mm@kvack.org
