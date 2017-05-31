@@ -23,10 +23,224 @@
 #include <linux/slab.h>
 #include "hmat.h"
 
+#define NO_VALUE	-1
+#define LOCAL_INIT	"local_init"
+
 static LIST_HEAD(target_list);
 static LIST_HEAD(initiator_list);
+LIST_HEAD(locality_list);
 
 static bool bad_hmat;
+
+/* Performance attributes for an initiator/target pair. */
+static int get_performance_data(u32 init_pxm, u32 tgt_pxm,
+		struct acpi_hmat_locality *hmat_loc)
+{
+	int num_init = hmat_loc->number_of_initiator_Pds;
+	int num_tgt = hmat_loc->number_of_target_Pds;
+	int init_idx = NO_VALUE;
+	int tgt_idx = NO_VALUE;
+	u32 *initiators, *targets;
+	u16 *entries, val;
+	int i;
+
+	/* the initiator array is after the struct acpi_hmat_locality fields */
+	initiators = (u32 *)(hmat_loc + 1);
+	targets = &initiators[num_init];
+	entries = (u16 *)&targets[num_tgt];
+
+	for (i = 0; i < num_init; i++) {
+		if (initiators[i] == init_pxm) {
+			init_idx = i;
+			break;
+		}
+	}
+
+	if (init_idx == NO_VALUE)
+		return NO_VALUE;
+
+	for (i = 0; i < num_tgt; i++) {
+		if (targets[i] == tgt_pxm) {
+			tgt_idx = i;
+			break;
+		}
+	}
+
+	if (tgt_idx == NO_VALUE)
+		return NO_VALUE;
+
+	val = entries[init_idx*num_tgt + tgt_idx];
+	if (val < 10 || val == 0xFFFF)
+		return NO_VALUE;
+
+	return (val * hmat_loc->entry_base_unit) / 10;
+}
+
+/*
+ * 'direction' is either READ or WRITE
+ * Latency is reported in nanoseconds and bandwidth is reported in MB/s.
+ */
+static int hmat_get_attribute(int init_pxm, int tgt_pxm, int direction,
+		enum hmat_attr_type type)
+{
+	struct memory_locality *loc;
+	int value;
+
+	list_for_each_entry(loc, &locality_list, list) {
+		struct acpi_hmat_locality *hmat_loc = loc->hmat_loc;
+
+		if (direction == READ && type == LATENCY &&
+		    (hmat_loc->data_type == ACPI_HMAT_ACCESS_LATENCY ||
+		     hmat_loc->data_type == ACPI_HMAT_READ_LATENCY)) {
+			value = get_performance_data(init_pxm, tgt_pxm,
+					hmat_loc);
+			if (value != NO_VALUE)
+				return value;
+		}
+
+		if (direction == WRITE && type == LATENCY &&
+		    (hmat_loc->data_type == ACPI_HMAT_ACCESS_LATENCY ||
+		     hmat_loc->data_type == ACPI_HMAT_WRITE_LATENCY)) {
+			value = get_performance_data(init_pxm, tgt_pxm,
+					hmat_loc);
+			if (value != NO_VALUE)
+				return value;
+		}
+
+		if (direction == READ && type == BANDWIDTH &&
+		    (hmat_loc->data_type == ACPI_HMAT_ACCESS_BANDWIDTH ||
+		     hmat_loc->data_type == ACPI_HMAT_READ_BANDWIDTH)) {
+			value = get_performance_data(init_pxm, tgt_pxm,
+					hmat_loc);
+			if (value != NO_VALUE)
+				return value;
+		}
+
+		if (direction == WRITE && type == BANDWIDTH &&
+		    (hmat_loc->data_type == ACPI_HMAT_ACCESS_BANDWIDTH ||
+		     hmat_loc->data_type == ACPI_HMAT_WRITE_BANDWIDTH)) {
+			value = get_performance_data(init_pxm, tgt_pxm,
+					hmat_loc);
+			if (value != NO_VALUE)
+				return value;
+		}
+	}
+
+	return NO_VALUE;
+}
+
+/*
+ * 'direction' is either READ or WRITE
+ * Latency is reported in nanoseconds and bandwidth is reported in MB/s.
+ */
+int hmat_local_attribute(struct device *tgt_dev, int direction,
+		enum hmat_attr_type type)
+{
+	struct memory_target *tgt = to_memory_target(tgt_dev);
+	int tgt_pxm = tgt->ma->proximity_domain;
+	int init_pxm;
+
+	if (!tgt->local_init)
+		return NO_VALUE;
+
+	init_pxm = tgt->local_init->pxm;
+	return hmat_get_attribute(init_pxm, tgt_pxm, direction, type);
+}
+
+static bool is_local_init(int init_pxm, int tgt_pxm, int read_lat,
+		int write_lat, int read_bw, int write_bw)
+{
+	if (read_lat != hmat_get_attribute(init_pxm, tgt_pxm, READ, LATENCY))
+		return false;
+
+	if (write_lat != hmat_get_attribute(init_pxm, tgt_pxm, WRITE, LATENCY))
+		return false;
+
+	if (read_bw != hmat_get_attribute(init_pxm, tgt_pxm, READ, BANDWIDTH))
+		return false;
+
+	if (write_bw != hmat_get_attribute(init_pxm, tgt_pxm, WRITE, BANDWIDTH))
+		return false;
+
+	return true;
+}
+
+static const struct attribute_group performance_attribute_group = {
+	.attrs = performance_attributes,
+	.name = LOCAL_INIT,
+};
+
+static void remove_performance_attributes(struct memory_target *tgt)
+{
+	if (!tgt->local_init)
+		return;
+
+	/*
+	 * FIXME: Need to enhance the core sysfs code to remove all the links
+	 * in both the attribute group and in the device itself when those are
+	 * removed.
+	 */
+	sysfs_remove_group(&tgt->dev.kobj, &performance_attribute_group);
+}
+
+static int add_performance_attributes(struct memory_target *tgt)
+{
+	int read_lat, write_lat, read_bw, write_bw;
+	int tgt_pxm = tgt->ma->proximity_domain;
+	struct kobject *init_kobj, *tgt_kobj;
+	struct device *init_dev, *tgt_dev;
+	struct memory_initiator *init;
+	int ret;
+
+	if (!tgt->local_init)
+		return 0;
+
+	tgt_dev = &tgt->dev;
+	tgt_kobj = &tgt_dev->kobj;
+
+	/* Create entries for initiator/target pair in the target.  */
+	ret = sysfs_create_group(tgt_kobj, &performance_attribute_group);
+	if (ret < 0)
+		return ret;
+
+	/*
+	 * Iterate through initiators and find all the ones that have the same
+	 * performance as the local initiator.
+	 */
+	read_lat = hmat_local_attribute(tgt_dev, READ, LATENCY);
+	write_lat = hmat_local_attribute(tgt_dev, WRITE, LATENCY);
+	read_bw = hmat_local_attribute(tgt_dev, READ, BANDWIDTH);
+	write_bw = hmat_local_attribute(tgt_dev, WRITE, BANDWIDTH);
+
+	list_for_each_entry(init, &initiator_list, list) {
+		init_dev = &init->dev;
+		init_kobj = &init_dev->kobj;
+
+		if (init == tgt->local_init ||
+			is_local_init(init->pxm, tgt_pxm, read_lat,
+				write_lat, read_bw, write_bw)) {
+			ret = sysfs_add_link_to_group(tgt_kobj, LOCAL_INIT,
+					init_kobj, dev_name(init_dev));
+			if (ret < 0)
+				goto err;
+
+			/*
+			 * Create a link in the local initiator to this
+			 * target.
+			 */
+			ret = sysfs_create_link(init_kobj, tgt_kobj,
+					kobject_name(tgt_kobj));
+			if (ret < 0)
+				goto err;
+		}
+
+	}
+	tgt->has_perf_attributes = true;
+	return 0;
+err:
+	remove_performance_attributes(tgt);
+	return ret;
+}
 
 static int link_node_for_kobj(unsigned int node, struct kobject *kobj)
 {
@@ -133,6 +347,9 @@ static void release_memory_target(struct device *dev)
 
 static void __init remove_memory_target(struct memory_target *tgt)
 {
+	if (tgt->has_perf_attributes)
+		remove_performance_attributes(tgt);
+
 	if (tgt->is_registered) {
 		remove_node_for_kobj(pxm_to_node(tgt->ma->proximity_domain),
 				&tgt->dev.kobj);
@@ -262,6 +479,38 @@ hmat_parse_address_range(struct acpi_subtable_header *header,
 err:
 	bad_hmat = true;
 	return -EINVAL;
+}
+
+static int __init hmat_parse_locality(struct acpi_subtable_header *header,
+		const unsigned long end)
+{
+	struct acpi_hmat_locality *hmat_loc;
+	struct memory_locality *loc;
+
+	if (bad_hmat)
+		return 0;
+
+	hmat_loc = (struct acpi_hmat_locality *)header;
+	if (!hmat_loc) {
+		pr_err("HMAT: NULL table entry\n");
+		bad_hmat = true;
+		return -EINVAL;
+	}
+
+	/* We don't report cached performance information in sysfs. */
+	if (hmat_loc->flags == ACPI_HMAT_MEMORY ||
+			hmat_loc->flags == ACPI_HMAT_LAST_LEVEL_CACHE) {
+		loc = kzalloc(sizeof(*loc), GFP_KERNEL);
+		if (!loc) {
+			bad_hmat = true;
+			return -ENOMEM;
+		}
+
+		loc->hmat_loc = hmat_loc;
+		list_add_tail(&loc->list, &locality_list);
+	}
+
+	return 0;
 }
 
 static int __init hmat_parse_cache(struct acpi_subtable_header *header,
@@ -419,6 +668,7 @@ srat_parse_memory_affinity(struct acpi_subtable_header *header,
 static void hmat_cleanup(void)
 {
 	struct memory_initiator *init, *init_iter;
+	struct memory_locality *loc, *loc_iter;
 	struct memory_target *tgt, *tgt_iter;
 
 	list_for_each_entry_safe(tgt, tgt_iter, &target_list, list)
@@ -426,6 +676,11 @@ static void hmat_cleanup(void)
 
 	list_for_each_entry_safe(init, init_iter, &initiator_list, list)
 		remove_memory_initiator(init);
+
+	list_for_each_entry_safe(loc, loc_iter, &locality_list, list) {
+		list_del(&loc->list);
+		kfree(loc);
+	}
 }
 
 static int __init hmat_init(void)
@@ -476,13 +731,15 @@ static int __init hmat_init(void)
 	}
 
 	if (!acpi_table_parse(ACPI_SIG_HMAT, hmat_noop_parse)) {
-		struct acpi_subtable_proc hmat_proc[2];
+		struct acpi_subtable_proc hmat_proc[3];
 
 		memset(hmat_proc, 0, sizeof(hmat_proc));
 		hmat_proc[0].id = ACPI_HMAT_TYPE_ADDRESS_RANGE;
 		hmat_proc[0].handler = hmat_parse_address_range;
 		hmat_proc[1].id = ACPI_HMAT_TYPE_CACHE;
 		hmat_proc[1].handler = hmat_parse_cache;
+		hmat_proc[2].id = ACPI_HMAT_TYPE_LOCALITY;
+		hmat_proc[2].handler = hmat_parse_locality;
 
 		acpi_table_parse_entries_array(ACPI_SIG_HMAT,
 					sizeof(struct acpi_table_hmat),
@@ -502,6 +759,10 @@ static int __init hmat_init(void)
 
 	list_for_each_entry(tgt, &target_list, list) {
 		ret = register_memory_target(tgt);
+		if (ret)
+			goto err;
+
+		ret = add_performance_attributes(tgt);
 		if (ret)
 			goto err;
 	}
