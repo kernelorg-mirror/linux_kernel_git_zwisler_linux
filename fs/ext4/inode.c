@@ -5949,13 +5949,15 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 	 * fallocate or buffered writes in dioread_nolock mode covered by
 	 * dirty data which can be converted only after flushing the dirty
 	 * data (and journalled aops don't know how to handle these cases).
+	 *
+	 * Because the changes to our journaling mode may also modify S_DAX we
+	 * need to hold off I/O and page faults so we can write back any dirty
+	 * data and invalidate all mappings.
 	 */
-	if (val) {
-		down_write(&EXT4_I(inode)->i_mmap_sem);
-		err = filemap_write_and_wait(inode->i_mapping);
-		if (err < 0)
-			goto out_unlock;
-	}
+	down_write(&EXT4_I(inode)->i_mmap_sem);
+	err = filemap_write_and_wait(inode->i_mapping);
+	if (err < 0)
+		goto out_unlock;
 
 	percpu_down_write(&sbi->s_journal_flag_rwsem);
 	jbd2_journal_lock_updates(journal);
@@ -5976,6 +5978,11 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 			goto out_journal_unlock;
 		ext4_clear_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
 	}
+
+	err = invalidate_inode_pages2(inode->i_mapping);
+	if (err < 0)
+		goto out_journal_unlock;
+
 	ext4_set_aops(inode);
 	/*
 	 * Update inode->i_flags after EXT4_INODE_JOURNAL_DATA was updated.
@@ -5986,8 +5993,7 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 	jbd2_journal_unlock_updates(journal);
 	percpu_up_write(&sbi->s_journal_flag_rwsem);
 
-	if (val)
-		up_write(&EXT4_I(inode)->i_mmap_sem);
+	up_write(&EXT4_I(inode)->i_mmap_sem);
 	ext4_inode_resume_unlocked_dio(inode);
 
 	/* Finally we can mark the inode as dirty. */
@@ -6007,8 +6013,7 @@ out_journal_unlock:
 	jbd2_journal_unlock_updates(journal);
 	percpu_up_write(&sbi->s_journal_flag_rwsem);
 out_unlock:
-	if (val)
-		up_write(&EXT4_I(inode)->i_mmap_sem);
+	up_write(&EXT4_I(inode)->i_mmap_sem);
 	ext4_inode_resume_unlocked_dio(inode);
 	return err;
 }
