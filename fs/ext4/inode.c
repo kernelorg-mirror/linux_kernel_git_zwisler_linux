@@ -5953,11 +5953,8 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 	if (val) {
 		down_write(&EXT4_I(inode)->i_mmap_sem);
 		err = filemap_write_and_wait(inode->i_mapping);
-		if (err < 0) {
-			up_write(&EXT4_I(inode)->i_mmap_sem);
-			ext4_inode_resume_unlocked_dio(inode);
-			return err;
-		}
+		if (err < 0)
+			goto out_unlock;
 	}
 
 	percpu_down_write(&sbi->s_journal_flag_rwsem);
@@ -5975,12 +5972,8 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 		ext4_set_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
 	else {
 		err = jbd2_journal_flush(journal);
-		if (err < 0) {
-			jbd2_journal_unlock_updates(journal);
-			percpu_up_write(&sbi->s_journal_flag_rwsem);
-			ext4_inode_resume_unlocked_dio(inode);
-			return err;
-		}
+		if (err < 0)
+			goto out_journal_unlock;
 		ext4_clear_inode_flag(inode, EXT4_INODE_JOURNAL_DATA);
 	}
 	ext4_set_aops(inode);
@@ -6008,6 +6001,15 @@ int ext4_change_inode_journal_flag(struct inode *inode, int val)
 	ext4_journal_stop(handle);
 	ext4_std_error(inode->i_sb, err);
 
+	return err;
+
+out_journal_unlock:
+	jbd2_journal_unlock_updates(journal);
+	percpu_up_write(&sbi->s_journal_flag_rwsem);
+out_unlock:
+	if (val)
+		up_write(&EXT4_I(inode)->i_mmap_sem);
+	ext4_inode_resume_unlocked_dio(inode);
 	return err;
 }
 
