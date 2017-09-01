@@ -462,9 +462,10 @@ static inline int ext4_should_dioread_nolock(struct inode *inode)
 	return 1;
 }
 
-static inline bool ext4_should_use_dax(struct inode *inode)
+static inline bool ext4_should_use_dax(struct inode *inode,
+		bool dax_inode_flag)
 {
-	if (!test_opt(inode->i_sb, DAX))
+	if (!(test_opt(inode->i_sb, DAX) || dax_inode_flag))
 		return false;
 	if (!S_ISREG(inode->i_mode))
 		return false;

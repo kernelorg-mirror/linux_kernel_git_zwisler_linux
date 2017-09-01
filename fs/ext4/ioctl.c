@@ -22,6 +22,7 @@
 #include <linux/fsmap.h>
 #include "fsmap.h"
 #include <trace/events/ext4.h>
+#include <linux/dax.h>
 
 /**
  * Swap memory between @a and @b for @len bytes.
@@ -205,6 +206,41 @@ static int uuid_is_zero(__u8 u[16])
 }
 #endif
 
+static int ext4_ioctl_dax_invalidate(struct inode *inode, bool dax_inode_flag)
+{
+	bool old_dax = !!(inode->i_flags & S_DAX);
+	bool new_dax = ext4_should_use_dax(inode, dax_inode_flag);
+	struct super_block *sb = inode->i_sb;
+
+	lockdep_assert_held(&inode->i_rwsem);
+	lockdep_assert_held(&EXT4_I(inode)->i_mmap_sem);
+
+	if (dax_inode_flag) {
+		if (ext4_has_feature_inline_data(sb)) {
+			ext4_msg(sb, KERN_ERR, "Cannot use DAX on a filesystem"
+					" that may contain inline data");
+			return -EINVAL;
+		}
+		if (!(S_ISREG(inode->i_mode) || S_ISDIR(inode->i_mode)))
+			return -EINVAL;
+		if (bdev_dax_supported(sb, sb->s_blocksize) < 0)
+			return -EINVAL;
+	}
+
+	if (old_dax != new_dax) {
+		int err;
+
+		err = filemap_write_and_wait(inode->i_mapping);
+		if (err)
+			return err;
+
+		err = invalidate_inode_pages2(inode->i_mapping);
+		if (err)
+			return err;
+	}
+	return 0;
+}
+
 static int ext4_ioctl_setflags(struct inode *inode,
 			       unsigned int flags)
 {
@@ -258,10 +294,15 @@ static int ext4_ioctl_setflags(struct inode *inode,
 			goto flags_out;
 	}
 
+	down_write(&ei->i_mmap_sem);
+	err = ext4_ioctl_dax_invalidate(inode, !!(flags & EXT4_DAX_FL));
+	if (err)
+		goto unlock_out;
+
 	handle = ext4_journal_start(inode, EXT4_HT_INODE, 1);
 	if (IS_ERR(handle)) {
 		err = PTR_ERR(handle);
-		goto flags_out;
+		goto unlock_out;
 	}
 	if (IS_SYNC(inode))
 		ext4_handle_sync(handle);
@@ -286,6 +327,7 @@ static int ext4_ioctl_setflags(struct inode *inode,
 
 	err = ext4_mark_iloc_dirty(handle, inode, &iloc);
 flags_err:
+	up_write(&ei->i_mmap_sem);
 	ext4_journal_stop(handle);
 	if (err)
 		goto flags_out;
@@ -302,6 +344,10 @@ flags_err:
 	}
 
 flags_out:
+	return err;
+
+unlock_out:
+	up_write(&ei->i_mmap_sem);
 	return err;
 }
 
@@ -425,12 +471,15 @@ static inline __u32 ext4_iflags_to_xflags(unsigned long iflags)
 		xflags |= FS_XFLAG_NOATIME;
 	if (iflags & EXT4_PROJINHERIT_FL)
 		xflags |= FS_XFLAG_PROJINHERIT;
+	if (iflags & EXT4_DAX_FL)
+		xflags |= FS_XFLAG_DAX;
 	return xflags;
 }
 
 #define EXT4_SUPPORTED_FS_XFLAGS (FS_XFLAG_SYNC | FS_XFLAG_IMMUTABLE | \
 				  FS_XFLAG_APPEND | FS_XFLAG_NODUMP | \
-				  FS_XFLAG_NOATIME | FS_XFLAG_PROJINHERIT)
+				  FS_XFLAG_NOATIME | FS_XFLAG_PROJINHERIT | \
+				  FS_XFLAG_DAX)
 
 /* Transfer xflags flags to internal */
 static inline unsigned long ext4_xflags_to_iflags(__u32 xflags)
@@ -449,6 +498,8 @@ static inline unsigned long ext4_xflags_to_iflags(__u32 xflags)
 		iflags |= EXT4_NOATIME_FL;
 	if (xflags & FS_XFLAG_PROJINHERIT)
 		iflags |= EXT4_PROJINHERIT_FL;
+	if (xflags & FS_XFLAG_DAX)
+		iflags |= EXT4_DAX_FL;
 
 	return iflags;
 }
